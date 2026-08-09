@@ -1129,7 +1129,6 @@ pub fn Commands(comptime App: type) type {
                 app.selected_model.appendSliceAssumeCapacity(stable);
             }
             const selected = app.selected_model.items;
-            try app.worker.syncQueuedPromptModel(std.heap.c_allocator, selected);
             if (comptime @hasDecl(App, "persistAcceptedModel")) try app.persistAcceptedModel(selected);
             terminalTitle(app).setModel(selected);
 
@@ -1579,15 +1578,12 @@ const FakeSession = struct {
 const FakeWorker = struct {
     synced_mode: ?types.PermissionMode = null,
     synced_state_mode: ?types.PermissionMode = null,
-    synced_model: ?[]u8 = null,
-    synced_model_alloc: ?std.mem.Allocator = null,
     synced_fast_mode: ?bool = null,
     fast_sync_count: usize = 0,
     synced_effort: ?types.ReasoningEffort = null,
     effort_sync_count: usize = 0,
 
     fn deinit(self: *FakeWorker) void {
-        if (self.synced_model) |model| self.synced_model_alloc.?.free(model);
         self.* = .{};
     }
 
@@ -1599,16 +1595,6 @@ const FakeWorker = struct {
         _ = alloc;
         _ = grants;
         self.synced_state_mode = snapshot.mode;
-    }
-
-    fn syncQueuedPromptModel(self: *FakeWorker, alloc: std.mem.Allocator, model: []const u8) !void {
-        if (self.synced_model) |old| {
-            self.synced_model_alloc.?.free(old);
-            self.synced_model = null;
-            self.synced_model_alloc = null;
-        }
-        self.synced_model = try alloc.dupe(u8, model);
-        self.synced_model_alloc = alloc;
     }
 
     fn syncQueuedPromptFastMode(self: *FakeWorker, enabled: bool) void {
@@ -2198,11 +2184,10 @@ test "session_commands handleModel reports current model for empty query" {
     try Commands(FakeApp).handleModel(&app, "");
 
     try std.testing.expectEqualStrings("● Model: anthropic/claude-opus-4.6\n", app.text());
-    try std.testing.expect(app.worker.synced_model == null);
     try std.testing.expectEqualStrings("", app.terminalTitleModelText());
 }
 
-test "session_commands handleModel resolves fuzzy cached model and syncs queued prompts" {
+test "session_commands handleModel resolves fuzzy cached model for future turns" {
     const alloc = std.testing.allocator;
     const ids = [_][]const u8{
         "openai/gpt-4o-mini",
@@ -2215,7 +2200,6 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
     try Commands(FakeApp).handleModel(&app, "claude sonnet");
 
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.selected_model.items);
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.worker.synced_model.?);
     try std.testing.expectEqualStrings(app.selected_model.items, app.terminalTitleModelText());
     try expectTranscriptContains(&app, "● Switched to anthropic/claude-sonnet-4-20250514");
 }
@@ -2229,7 +2213,6 @@ test "session_commands handleModel falls back to raw query when model fetch fail
     try Commands(FakeApp).handleModel(&app, "custom/provider-model");
 
     try std.testing.expectEqualStrings("custom/provider-model", app.selected_model.items);
-    try std.testing.expectEqualStrings("custom/provider-model", app.worker.synced_model.?);
     try std.testing.expectEqualStrings(app.selected_model.items, app.terminalTitleModelText());
 }
 
@@ -2740,7 +2723,6 @@ test "session_commands selectModelFromPicker skips effort changes for models wit
     try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-4o", types.ReasoningEffort.literal("low"), true);
 
     try std.testing.expectEqualStrings("openai/gpt-4o", app.selected_model.items);
-    try std.testing.expectEqualStrings("openai/gpt-4o", app.worker.synced_model.?);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
     try std.testing.expect(!app.fast_mode);
 }
@@ -2777,7 +2759,6 @@ test "session_commands selectModelFromPicker persists portable Gateway reasoning
     try Commands(FakeApp).selectModelFromPicker(&app, "provider/new-reasoning-model", types.ReasoningEffort.literal("low"), true);
 
     try std.testing.expectEqualStrings("provider/new-reasoning-model", app.selected_model.items);
-    try std.testing.expectEqualStrings("provider/new-reasoning-model", app.worker.synced_model.?);
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.effort);
     try std.testing.expect(!app.fast_mode);
     try std.testing.expectEqual(@as(?types.ReasoningEffort, types.ReasoningEffort.literal("low")), app.worker.synced_effort);
@@ -3020,7 +3001,6 @@ test "session_commands runtime-first model keeps runtime state when both durable
     try Commands(FakeApp).handleModel(&app, "new/model");
 
     try std.testing.expectEqualStrings("new/model", app.selected_model.items);
-    try std.testing.expectEqualStrings("new/model", app.worker.synced_model.?);
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try expectTranscriptContains(
         &app,
