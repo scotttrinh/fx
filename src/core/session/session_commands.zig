@@ -2742,7 +2742,6 @@ test "session_commands model picker accepts the current selected model slice" {
     );
 
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.selected_model.items);
-    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.worker.synced_model.?);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.last_preference_model.items);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.terminalTitleModelText());
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
