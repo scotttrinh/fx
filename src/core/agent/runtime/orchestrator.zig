@@ -1368,10 +1368,16 @@ fn streamPermissionReviewAttempt(
         request.usage,
         request.usage_allocator,
         request.trace_ctx,
+        16 * 1024,
         8 * 1024,
         &failure_info,
         .transport,
     ) catch |err| {
+        debug_trace.logf(
+            "permission",
+            "event=auto_review_stream_failure err={s}",
+            .{@errorName(err)},
+        );
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled or request.cancel_flag.load(.seq_cst)) return .cancelled;
         if (err == error.Timeout) return .timed_out;
@@ -1383,6 +1389,14 @@ fn streamPermissionReviewAttempt(
     }
     if (result.status != .ok) {
         const status = result.status;
+        debug_trace.logf(
+            "permission",
+            "event=auto_review_stream_rejected status={d} category={s}",
+            .{
+                @intFromEnum(status),
+                if (failure_info) |failure| @tagName(failure.category) else "unknown",
+            },
+        );
         result.deinit(alloc);
         return permissionReviewFailureOutcome(failure_info, status);
     }
@@ -1417,6 +1431,7 @@ test "permission review sends usage and generation metadata through session usag
             _: agent_stream_provider.AdapterRequest,
             events: agent_stream_provider.EventSink,
         ) anyerror!void {
+            try events.emit(.provider_admitted);
             try events.emit(.{ .usage = .{ .tokens = .{
                 .input_tokens = 3,
                 .output_tokens = 5,
@@ -1456,6 +1471,7 @@ test "permission review sends usage and generation metadata through session usag
         .tenant = null,
         .model = "reviewer-a",
         .model_request = .{
+            .model = "reviewer-a",
             .serialized_tools = "[]",
             .messages = &.{},
             .tool_choice = .auto,
@@ -1504,6 +1520,7 @@ test "production permission reviewer bounds normalized failure attempts" {
         ) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(adapter.context.?));
             self.calls += 1;
+            if (self.outcome != .cancelled) try events.emit(.provider_admitted);
             switch (self.outcome) {
                 .request_timeout => try events.emit(.{ .failure = .{
                     .category = .protocol,
@@ -1566,6 +1583,7 @@ test "production permission reviewer bounds normalized failure attempts" {
             .pending_assistant = pending,
             .target_call_id = "call-1",
             .origin = .root,
+            .current_root_request = "Inspect this workspace.",
             .root_text_bindings = &.{.{
                 .message_index = 0,
                 .text = "Inspect this workspace.",
@@ -1583,8 +1601,8 @@ test "production permission reviewer bounds normalized failure attempts" {
     inline for (.{
         .{ Fixture.Outcome.request_timeout, @as(usize, 1) },
         .{ Fixture.Outcome.gateway_timeout, @as(usize, 1) },
-        .{ Fixture.Outcome.rate_limited, @as(usize, 2) },
-        .{ Fixture.Outcome.transient, @as(usize, 2) },
+        .{ Fixture.Outcome.rate_limited, @as(usize, 1) },
+        .{ Fixture.Outcome.transient, @as(usize, 1) },
         .{ Fixture.Outcome.permanent, @as(usize, 1) },
         .{ Fixture.Outcome.content_filter, @as(usize, 1) },
     }) |case| {
@@ -3253,6 +3271,7 @@ fn processQueuedPromptLoop(
                 deps.usage,
                 deps.usage_allocator,
                 step_ctx,
+                null,
                 null,
                 null,
                 .agent,
