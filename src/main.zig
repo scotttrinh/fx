@@ -1895,7 +1895,6 @@ const App = struct {
             max_read_file_line_len,
             max_command_output_bytes,
             builtin_gateway.retry_count,
-            builtin_gateway.defaultChatUrl(),
         );
         return tool_admission.preparePermissionStateAction(
             ctx.admissionInput(),
