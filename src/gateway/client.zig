@@ -16,6 +16,7 @@ pub fn isRetryableGatewayError(err: anyerror) bool {
 pub fn networkFailureEvidence(
     err: anyerror,
     delivery: DeliveryCertainty.State,
+    stage: agent_stream_provider.NetworkFailureStage,
 ) ?agent_stream_provider.NetworkFailureEvidence {
     const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
         .system_resumed
@@ -23,7 +24,12 @@ pub fn networkFailureEvidence(
         .transport_interrupted
     else
         return null;
-    return .{ .cause = cause, .delivery = delivery };
+    return .{
+        .cause = cause,
+        .delivery = delivery,
+        .stage = stage,
+        .error_name = @errorName(err),
+    };
 }
 
 fn isRetryableAgentNetworkError(err: anyerror) bool {
@@ -110,17 +116,21 @@ test "native network failure evidence covers setup send read and resume failures
         const evidence = networkFailureEvidence(
             case.err,
             .possibly_sent,
+            .response_body,
         ) orelse return error.TestExpectedNetworkFailureEvidence;
         try std.testing.expectEqual(case.cause, evidence.cause);
         try std.testing.expectEqual(
             DeliveryCertainty.State.possibly_sent,
             evidence.delivery,
         );
+        try std.testing.expectEqual(agent_stream_provider.NetworkFailureStage.response_body, evidence.stage);
+        try std.testing.expectEqualStrings(@errorName(case.err), evidence.error_name);
     }
 
     const pre_send = networkFailureEvidence(
         error.ConnectionRefused,
         .definitely_unsent,
+        .connection_setup,
     ).?;
     try std.testing.expectEqual(
         DeliveryCertainty.State.definitely_unsent,
@@ -142,7 +152,7 @@ test "native network failure evidence excludes opaque and configuration failures
     for (excluded) |err| {
         try std.testing.expectEqual(
             @as(?agent_stream_provider.NetworkFailureEvidence, null),
-            networkFailureEvidence(err, .definitely_unsent),
+            networkFailureEvidence(err, .definitely_unsent, .unknown),
         );
     }
 }
@@ -1000,6 +1010,7 @@ pub const StreamRequest = struct {
     trace_ctx: debug_trace.TraceContext = .{},
     content_capture_limit: ?usize = null,
     delivery: ?*DeliveryCertainty = null,
+    failure_stage: ?*agent_stream_provider.NetworkFailureStage = null,
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
@@ -1171,6 +1182,7 @@ fn streamGatewayCompletionCoreWithOptions(
         .transport => request.retry_count,
     };
     const trace_ctx = request.trace_ctx;
+    if (request.failure_stage) |stage| stage.* = .connection_setup;
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_chat_url_env, request.chat_url);
     const uri = try std.Uri.parse(request_url);
 
@@ -1286,6 +1298,7 @@ fn streamGatewayCompletionCoreWithOptions(
         }
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
+        if (request.failure_stage) |stage| stage.* = .request_send;
         req.transfer_encoding = .{ .content_length = payload.len };
         var send_buf: [8192]u8 = undefined;
         debug_trace.eventf("gateway", "before_request_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
@@ -1326,6 +1339,7 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "after_request_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
         debug_trace.eventf("gateway", "after_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
 
+        if (request.failure_stage) |stage| stage.* = .response_head;
         debug_trace.eventf("gateway", "before_receive_head", trace_ctx, "attempt={d}", .{attempt + 1});
         var response = req.receiveHead(&.{}) catch |err| {
             debug_trace.eventf("gateway", "receive_head_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
@@ -1384,6 +1398,7 @@ fn streamGatewayCompletionCoreWithOptions(
             };
         }
 
+        if (request.failure_stage) |stage| stage.* = .response_body;
         var transfer_buf: [gateway_transfer_buffer_bytes]u8 = undefined;
         const body_reader = response.reader(&transfer_buf);
         debug_trace.eventf("gateway", "before_sse_consume", trace_ctx, "attempt={d}", .{attempt + 1});
@@ -6284,6 +6299,7 @@ test "agent-owned provider attempts return immediate peer resets without transpo
         const evidence = networkFailureEvidence(
             err,
             delivery.load(),
+            .connection_setup,
         ) orelse return error.TestExpectedNetworkFailureEvidence;
         try std.testing.expectEqual(
             agent_stream_provider.NetworkFailureCause.transport_interrupted,

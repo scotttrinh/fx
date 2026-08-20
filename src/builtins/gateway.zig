@@ -425,6 +425,7 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
+    var failure_stage: agent_stream_provider_contract.NetworkFailureStage = .unknown;
     const result = gateway_client.streamGatewayCompletion(
         alloc,
         .{
@@ -438,6 +439,7 @@ fn streamAgentCompletion(
             .trace_ctx = request.trace_ctx,
             .content_capture_limit = request.content_capture_limit,
             .delivery = request.delivery,
+            .failure_stage = &failure_stage,
             .on_reasoning_chunk = request.on_reasoning_chunk,
             .on_tool_input_chunk = request.on_tool_input_chunk,
             .provider_attempt_owner = switch (request.provider_attempt_owner) {
@@ -453,6 +455,7 @@ fn streamAgentCompletion(
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
             err,
             request.delivery.load(),
+            failure_stage,
         );
         return err;
     };
