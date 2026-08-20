@@ -187,6 +187,26 @@ pub const GatewayJsonResult = union(enum) {
 pub const StreamCallback = agent_stream_provider.StreamCallback;
 pub const ToolStartCallback = agent_stream_provider.ToolStartCallback;
 
+/// Owns the persistent native AI Gateway HTTP transport. The allocator must
+/// remain valid for the runtime lifetime and support concurrent callers.
+pub const Runtime = struct {
+    http_client: std.http.Client,
+
+    pub fn init(alloc: std.mem.Allocator) Runtime {
+        return .{
+            .http_client = .{
+                .allocator = alloc,
+                .io = io_mod.getIo(),
+            },
+        };
+    }
+
+    pub fn deinit(self: *Runtime) void {
+        self.http_client.deinit();
+        self.* = undefined;
+    }
+};
+
 const gateway_retry_base_delay_ns: u64 = 150 * std.time.ns_per_ms;
 const gateway_connection_setup_timeout_ms: i64 = 30_000;
 const gateway_retry_after_max_ns: u64 = 5 * std.time.ns_per_s;
@@ -773,6 +793,7 @@ const RequestOpenOverride = struct {
 const StreamCoreOptions = struct {
     setup_timing: ConnectionSetupTiming = .{},
     request_open_override: ?RequestOpenOverride = null,
+    http_client: ?*std.http.Client = null,
 };
 
 const RequestOpenOperation = struct {
@@ -1017,6 +1038,7 @@ pub const StreamRequest = struct {
 };
 
 pub fn streamGatewayCompletion(
+    runtime: *Runtime,
     alloc: std.mem.Allocator,
     request: StreamRequest,
     callback_ctx: *anyopaque,
@@ -1026,7 +1048,7 @@ pub fn streamGatewayCompletion(
 ) !StreamResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const expected_provider_tool_name = try expectedProviderToolName(alloc, request.payload);
-    return streamGatewayCompletionCore(
+    return streamGatewayCompletionCoreWithOptions(
         alloc,
         request,
         callback_ctx,
@@ -1035,6 +1057,7 @@ pub fn streamGatewayCompletion(
         cancel_flag,
         expected_provider_tool_name,
         true,
+        .{ .http_client = &runtime.http_client },
     );
 }
 
@@ -1197,14 +1220,16 @@ fn streamGatewayCompletionCoreWithOptions(
         request.session_id,
     );
 
+    var local_client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    defer if (core_options.http_client == null) local_client.deinit();
+    const http_client = core_options.http_client orelse &local_client;
+
     var attempt: usize = 0;
     var delivery_ambiguous = false;
     var request_body_possibly_sent = false;
     var setup_epoch: ?ConnectionSetupEpoch = null;
     while (attempt < retry_count) : (attempt += 1) {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-        defer client.deinit();
 
         if (setup_epoch == null) {
             setup_epoch = ConnectionSetupEpoch.init(core_options.setup_timing);
@@ -1219,7 +1244,7 @@ fn streamGatewayCompletionCoreWithOptions(
 
         debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} retry_count={d}", .{ attempt + 1, retry_count });
         debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} retry_count={d} payload_bytes={d}", .{ attempt + 1, retry_count, payload.len });
-        var req = openGatewayRequestBounded(&client, uri, .{
+        var req = openGatewayRequestBounded(http_client, uri, .{
             .headers = .{
                 .content_type = .{ .override = "application/json" },
                 .authorization = .{ .override = auth_header },
@@ -1227,7 +1252,7 @@ fn streamGatewayCompletionCoreWithOptions(
                 .user_agent = .{ .override = user_agent },
             },
             .extra_headers = extra_headers,
-            .keep_alive = false,
+            .keep_alive = true,
             .redirect_behavior = .unhandled,
         }, core_options.request_open_override, epoch, cancel_flag) catch |err| {
             debug_trace.eventf("gateway", "http_open_connect_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
@@ -1277,6 +1302,13 @@ fn streamGatewayCompletionCoreWithOptions(
         }
         setup_epoch = null;
         defer req.deinit();
+        // A connected error may leave the request reader in `.ready`, which
+        // std.http otherwise treats as reusable even when cancellation shut
+        // down the socket or a request write failed. Never return such a
+        // connection to the long-lived runtime pool.
+        errdefer {
+            if (req.connection) |conn| conn.closing = true;
+        }
         debug_trace.eventf("gateway", "after_http_open_connect", trace_ctx, "attempt={d}", .{attempt + 1});
         debug_trace.eventf("gateway", "after_request_open", trace_ctx, "attempt={d}", .{attempt + 1});
 
@@ -5480,6 +5512,8 @@ const LoopbackGatewayMode = enum {
     success_capture,
     model_catalog_success,
     private_model_catalog_success,
+    persistent_success_twice,
+    cancelled_stream_then_success,
 };
 
 const LoopbackGatewayFixture = struct {
@@ -5761,6 +5795,51 @@ const LoopbackGatewayFixture = struct {
                         "Content-Type: application/json\r\n" ++
                         "Connection: close\r\n\r\n" ++
                         loopback_private_model_catalog_json,
+                );
+            },
+            .persistent_success_twice => {
+                for (0..2) |_| {
+                    try readLoopbackGatewayRequest(zio, stream, self);
+                    try writeLoopbackGatewayBytes(
+                        zio,
+                        stream,
+                        "HTTP/1.1 200 OK\r\n" ++
+                            "Content-Type: text/event-stream\r\n" ++
+                            "Content-Length: 115\r\n" ++
+                            "Connection: keep-alive\r\n\r\n" ++
+                            "data: {\"type\":\"text-delta\",\"id\":\"answer\",\"delta\":\"ok\"}\n\n" ++
+                            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n",
+                    );
+                }
+                self.markStage();
+            },
+            .cancelled_stream_then_success => {
+                try readLoopbackGatewayRequest(zio, stream, self);
+                try writeLoopbackGatewayBytes(
+                    zio,
+                    stream,
+                    "HTTP/1.1 200 OK\r\n" ++
+                        "Content-Type: text/event-stream\r\n" ++
+                        "Connection: keep-alive\r\n\r\n" ++
+                        "data: {\"type\":\"text-delta\",\"id\":\"partial\",\"delta\":\"partial\"}\n\n",
+                );
+                self.markStage();
+                var byte: [1]u8 = undefined;
+                var reader = stream.reader(zio, &byte);
+                _ = reader.interface.takeByte() catch {};
+
+                var recovered_stream = try self.server.accept(zio);
+                defer recovered_stream.close(zio);
+                try readLoopbackGatewayRequest(zio, recovered_stream, self);
+                try writeLoopbackGatewayBytes(
+                    zio,
+                    recovered_stream,
+                    "HTTP/1.1 200 OK\r\n" ++
+                        "Content-Type: text/event-stream\r\n" ++
+                        "Content-Length: 115\r\n" ++
+                        "Connection: keep-alive\r\n\r\n" ++
+                        "data: {\"type\":\"text-delta\",\"id\":\"answer\",\"delta\":\"ok\"}\n\n" ++
+                        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n",
                 );
             },
         }
@@ -6386,6 +6465,124 @@ test "TLS setup does not retry after delivery when no certainty sink is provided
     if (harness.fixture.failure) |err| return err;
 }
 
+test "gateway runtime reuses one connection for sequential successful streams" {
+    var fixture = try LoopbackGatewayFixture.init(.persistent_success_twice, 0);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+
+    const chat_url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/v1/chat/completions",
+        .{fixture.port()},
+    );
+    defer std.testing.allocator.free(chat_url);
+
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    for (0..2) |_| {
+        var result = try streamGatewayCompletion(
+            &runtime,
+            std.testing.allocator,
+            .{
+                .api_key = "test-key",
+                .model = "provider/test-model",
+                .retry_count = 1,
+                .chat_url = chat_url,
+                .payload = "{}",
+            },
+            @ptrCast(&bounded_stream_discard_ctx),
+            discardBoundedContent,
+            null,
+            &cancel_flag,
+        );
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    }
+
+    try std.testing.expect(fixture.waitForSignal(&fixture.reached_stage, 5000));
+    fixture.deinit();
+    if (fixture.failure) |err| return err;
+}
+
+test "gateway runtime evicts a cancelled stream before the next request" {
+    var fixture = try LoopbackGatewayFixture.init(.cancelled_stream_then_success, 0);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+
+    const chat_url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/v1/chat/completions",
+        .{fixture.port()},
+    );
+    defer std.testing.allocator.free(chat_url);
+
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request_done = std.atomic.Value(bool).init(false);
+    const Cancel = struct {
+        fn run(
+            server_fixture: *LoopbackGatewayFixture,
+            flag: *std.atomic.Value(bool),
+            done: *std.atomic.Value(bool),
+        ) void {
+            if (!server_fixture.waitForStageOrDone(done)) return;
+            flag.store(true, .seq_cst);
+        }
+    };
+    const cancel_thread = try std.Thread.spawn(.{}, Cancel.run, .{
+        &fixture,
+        &cancel_flag,
+        &request_done,
+    });
+
+    try std.testing.expectError(
+        error.Cancelled,
+        streamGatewayCompletion(
+            &runtime,
+            std.testing.allocator,
+            .{
+                .api_key = "test-key",
+                .model = "provider/test-model",
+                .retry_count = 1,
+                .chat_url = chat_url,
+                .payload = "{}",
+            },
+            @ptrCast(&bounded_stream_discard_ctx),
+            discardBoundedContent,
+            null,
+            &cancel_flag,
+        ),
+    );
+    request_done.store(true, .seq_cst);
+    cancel_thread.join();
+
+    cancel_flag.store(false, .seq_cst);
+    var recovered = try streamGatewayCompletion(
+        &runtime,
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "provider/test-model",
+            .retry_count = 1,
+            .chat_url = chat_url,
+            .payload = "{}",
+        },
+        @ptrCast(&bounded_stream_discard_ctx),
+        discardBoundedContent,
+        null,
+        &cancel_flag,
+    );
+    defer recovered.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", recovered.completion.content.?);
+
+    fixture.deinit();
+    if (fixture.failure) |err| return err;
+}
+
 test "direct gateway cancellation before admission opens no connection" {
     var fixture = try LoopbackGatewayFixture.init(.success, 0);
     defer fixture.deinit();
@@ -6399,10 +6596,13 @@ test "direct gateway cancellation before admission opens no connection" {
     );
     defer std.testing.allocator.free(chat_url);
 
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
     var cancel_flag = std.atomic.Value(bool).init(true);
     try std.testing.expectError(
         error.Cancelled,
         streamGatewayCompletion(
+            &runtime,
             std.testing.allocator,
             .{
                 .api_key = "test-key",
@@ -6928,9 +7128,12 @@ test "bounded gateway progress does not extend the absolute deadline" {
 }
 
 test "delivery certainty stays definitely unsent when request setup fails" {
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
     var delivery = DeliveryCertainty.init();
     var cancel_flag = std.atomic.Value(bool).init(false);
     const result = streamGatewayCompletion(
+        &runtime,
         std.testing.allocator,
         .{
             .api_key = "test-key",

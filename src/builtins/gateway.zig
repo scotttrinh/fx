@@ -139,6 +139,31 @@ pub const provider = gateway_provider.Provider{
     .model_catalog = model_catalog_provider,
 };
 
+pub fn agentStreamProvider(runtime: *gateway_client.Runtime) agent_stream_provider_contract.Provider {
+    var result = agent_stream_provider;
+    result.context = runtime;
+    return result;
+}
+
+pub fn providerWithRuntime(runtime: *gateway_client.Runtime) gateway_provider.Provider {
+    var result = provider;
+    result.agent_stream = agentStreamProvider(runtime);
+    return result;
+}
+
+test "native agent stream provider carries its gateway runtime context" {
+    var runtime = gateway_client.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+
+    const stream_provider = agentStreamProvider(&runtime);
+    try std.testing.expect(stream_provider.context == @as(?*anyopaque, @ptrCast(&runtime)));
+    try std.testing.expect(stream_provider.stream_fn == streamAgentCompletion);
+
+    const gateway = providerWithRuntime(&runtime);
+    try std.testing.expect(gateway.agent_stream.context == stream_provider.context);
+    try std.testing.expect(gateway.agent_stream.stream_fn == stream_provider.stream_fn);
+}
+
 pub fn buildAgentRequest(
     _: ?*anyopaque,
     alloc: Allocator,
@@ -421,12 +446,15 @@ test "required vision request contains only the registered vision schema" {
 }
 
 fn streamAgentCompletion(
-    _: ?*anyopaque,
+    raw_context: ?*anyopaque,
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
+    const runtime: *gateway_client.Runtime = @ptrCast(@alignCast(raw_context orelse
+        return error.GatewayClientRuntimeUnavailable));
     var failure_stage: agent_stream_provider_contract.NetworkFailureStage = .unknown;
     const result = gateway_client.streamGatewayCompletion(
+        runtime,
         alloc,
         .{
             .api_key = request.api_key,
