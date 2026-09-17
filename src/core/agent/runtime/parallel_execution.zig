@@ -301,6 +301,26 @@ pub fn parallelHookFormatError(ctx: *anyopaque, alloc: Allocator, tool_name: []c
     return exec_ctx.hooks.format_tool_execution_error(exec_ctx.hooks.ctx, alloc, tool_name, err);
 }
 
+fn duplicateSubagentCompletion(
+    alloc: Allocator,
+    status_opt: ?types.SubagentStatus,
+) Allocator.Error!?types.SubagentStatus {
+    const status = status_opt orelse return null;
+    const model = try alloc.dupe(u8, status.model);
+    errdefer alloc.free(model);
+    const session_title = if (status.session_title) |title|
+        try alloc.dupe(u8, title)
+    else
+        null;
+    return .{
+        .model = model,
+        .effort = status.effort,
+        .input_tokens = status.input_tokens,
+        .context_window = status.context_window,
+        .session_title = session_title,
+    };
+}
+
 fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: ToolExecutionResult) Allocator.Error!ParallelToolResult {
     const call_id = try alloc.dupe(u8, call.id);
     errdefer alloc.free(call_id);
@@ -330,16 +350,10 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
         .model_output = try alloc.dupe(u8, execution.model_output),
         .web_search_completion = execution.web_search_completion,
         .web_fetch_completion = execution.web_fetch_completion,
-        .subagent_completion = if (execution.subagent_completion) |status| .{
-            .model = try alloc.dupe(u8, status.model),
-            .effort = status.effort,
-            .input_tokens = status.input_tokens,
-            .context_window = status.context_window,
-            .session_title = if (status.session_title) |title| try alloc.dupe(u8, title) else null,
-        } else null,
         .inner_usage = execution.inner_usage,
     };
     errdefer freeOwnedToolExecutionResult(alloc, duplicated_execution);
+    duplicated_execution.subagent_completion = try duplicateSubagentCompletion(alloc, execution.subagent_completion);
     if (execution.status_detail) |detail| {
         duplicated_execution.status_detail = try alloc.dupe(u8, detail);
     }
