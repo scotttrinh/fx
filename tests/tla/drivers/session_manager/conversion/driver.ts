@@ -191,7 +191,7 @@ export function fixture(label: string, at?: string, models?: object[]) {
       const bodies = (list: any[] = []) => list.map(r => r.body);
       writeFileSync(join(root, "gateway-requests.json"), JSON.stringify({
         completions: bodies(gateway.requests), classifier: bodies(gateway.classifierRequests),
-        evaluation: bodies(gateway.evaluationRequests), title: bodies(gateway.titleRequests),
+        decision: bodies(gateway.decisionRequests), title: bodies(gateway.titleRequests),
       }, null, 2));
       gateway.stop();
     } };

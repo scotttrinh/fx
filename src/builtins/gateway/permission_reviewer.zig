@@ -6,7 +6,7 @@ const types = @import("../../core/shared/types.zig");
 const stream_provider = @import("../../core/agent/stream_provider.zig");
 const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
 const vercel_model_policy = @import("../../gateway/vercel_model_policy.zig");
-const typesafe_permission_reviewer = @import("typesafe_permission_reviewer.zig");
+const gateway_decision_model = @import("../../gateway/decision_model.zig");
 const token_pass = @import("../../core/gateway/token_pass.zig");
 
 const Allocator = std.mem.Allocator;
@@ -49,16 +49,15 @@ fn reviewGateway(
     request: permission_auto_classifier.ReviewRequest,
 ) anyerror!permission_auto_classifier.ParseOutcome {
     // The review_model setting (or FX_REVIEW_MODEL) overrides the reviewer
-    // model. typesafeai/jev selects the TypeSafe System One reviewer; any
-    // other value stays on this gateway chat path with that model id. Every
-    // composition site selects this provider, so the override covers
-    // interactive, ask, and subagent reviews uniformly. Without one, a
+    // model. A gateway decision model answers the review as one decision
+    // question; any other value stays on this gateway chat path with that
+    // model id. Every composition site selects this provider, so the override
+    // covers interactive, ask, and subagent reviews uniformly. Without one, a
     // session on a Token Pass model is reviewed by a Token Pass model, so its
     // reviews stay on Token Pass credit too.
     const selected = selectedReviewerModel(input.reviewer_model, request.review_turn.model);
-    if (typesafe_permission_reviewer.isJevModelId(selected)) {
-        debug_trace.logf("permission", "event=auto_review_provider_selected provider={s}", .{typesafe_permission_reviewer.review_model_id});
-        return typesafe_permission_reviewer.review(null, alloc, input, request);
+    if (gateway_decision_model.isDecisionModelId(selected)) {
+        return reviewWithDecisionModel(alloc, input, request, selected);
     }
     return reviewGatewayConfig(.{
         .api_key = if (input.credential_source == .host_managed) null else input.credential,
@@ -67,6 +66,36 @@ fn reviewGateway(
         .chat_url = input.endpoint,
         .cancel_flag = input.cancel_flag,
     }, alloc, request, selected);
+}
+
+/// Reviews with the gateway decision model `model_id`, at the decision
+/// endpoint beside the session's chat endpoint and with the session's gateway
+/// credential. Without either, the review is unavailable and the action is
+/// held.
+fn reviewWithDecisionModel(
+    alloc: Allocator,
+    input: permission_auto_classifier.ProviderInput,
+    request: permission_auto_classifier.ReviewRequest,
+    model_id: []const u8,
+) !permission_auto_classifier.ParseOutcome {
+    var url_buf: [4096]u8 = undefined;
+    const url = gateway_decision_model.urlForChatUrl(input.endpoint, &url_buf);
+    if (url == null or input.credential.len == 0) {
+        debug_trace.logf("permission", "event=auto_review_decision_model result=unconfigured model={s} has_endpoint={} has_credential={}", .{ model_id, url != null, input.credential.len > 0 });
+        return .{ .invalid = .transport_unconfigured };
+    }
+    var config = gateway_decision_model.Config{
+        .api_key = input.credential,
+        .team = input.tenant,
+        .url = url.?,
+        .model_id = model_id,
+    };
+    debug_trace.logf("permission", "event=auto_review_decision_model model={s} endpoint={s}", .{ model_id, config.url });
+    return permission_auto_classifier.Reviewer.withDecisionModel(
+        config.model(),
+        input.cancel_flag,
+        permission_auto_classifier.Reviewer.default_timeout_ms,
+    ).review(alloc, request);
 }
 
 fn selectedReviewerModel(override: []const u8, session_model: []const u8) []const u8 {

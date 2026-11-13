@@ -424,9 +424,9 @@ export type FakeGatewayOptions = {
   // `/backend-api/wham/...`, Grok's `/billing` and `/settings`); see
   // usage-fakes.ts. Null falls through to the routes below.
   usage?: (url: URL, request: Request) => Response | null;
-  // Response for the /v4/ai/evaluation-model endpoint (TypeSafe Jev through
-  // the gateway). Defaults to a clear Jev decision.
-  evaluationResponse?: FakeGatewayResponse;
+  // Response for the /v4/ai/decision-model endpoint, which answers a review
+  // by a decision model. Defaults to a clear decision.
+  decisionResponse?: FakeGatewayResponse;
 };
 
 // Session title generation calls carry this instruction regardless of the
@@ -455,6 +455,30 @@ export function fakeResponsesTitleDefault() {
   );
 }
 
+// A decision model's answer to a review, in the AI Gateway decision-model
+// envelope: one answer per question, camelCase usage, and the provider's own
+// statistics under providerMetadata.
+export function fakeGatewayDecision(choice: "clear" | "caution") {
+  return Response.json({
+    answers: {
+      decision: {
+        type: "choice",
+        choice,
+        probabilities: choice === "clear"
+          ? { clear: 0.99, caution: 0.01 }
+          : { clear: 0.02, caution: 0.98 },
+      },
+    },
+    model: "typesafe-ai/jev-1.14.0",
+    rounding: { probabilityDecimals: 2, scoreDecimals: 2 },
+    usage: { inputTokens: 100, outputTokens: 10 },
+    warnings: [],
+    providerMetadata: {
+      typesafe: { confidence: { decision: 0.97 } },
+    },
+  });
+}
+
 function serveFakeGateway(
   nextCompletion: (body: string) => Response | Promise<Response>,
   options: FakeGatewayOptions,
@@ -464,7 +488,7 @@ function serveFakeGateway(
   // fx's second, identical review of a held action, kept apart so
   // classifierRequests counts one entry per review.
   const confirmationRequests: Array<{ body: string; headers: Headers }> = [];
-  const evaluationRequests: Array<{ body: string; headers: Headers }> = [];
+  const decisionRequests: Array<{ body: string; headers: Headers }> = [];
   const classifierResponses = [...(options.classifierResponses ?? [])];
   const confirmations = confirmationReplay();
   const titleRequests: Array<{ body: string; headers: Headers }> = [];
@@ -494,33 +518,17 @@ function serveFakeGateway(
       }
       if (
         req.method === "POST" &&
-        new URL(req.url).pathname === "/v4/ai/evaluation-model"
+        new URL(req.url).pathname === "/v4/ai/decision-model"
       ) {
-        evaluationRequests.push({
+        decisionRequests.push({
           body: await req.text(),
           headers: new Headers(req.headers),
         });
-        // Mirrors the real AI Gateway evaluation-model envelope: camelCase
-        // usage and confidence under providerMetadata.typesafe.
-        const evaluationResponse = options.evaluationResponse ??
-          Response.json({
-            answers: {
-              decision: {
-                type: "choice",
-                choice: "clear",
-                probabilities: { clear: 0.99, caution: 0.01 },
-              },
-            },
-            rounding: { probabilityDecimals: 2, scoreDecimals: 2 },
-            usage: { inputTokens: 100, outputTokens: 10 },
-            warnings: [],
-            providerMetadata: {
-              typesafe: { confidence: { decision: 0.97 } },
-            },
-          });
-        return typeof evaluationResponse === "function"
-          ? await evaluationResponse(evaluationRequests[evaluationRequests.length - 1].body)
-          : evaluationResponse;
+        const decisionResponse = options.decisionResponse ??
+          fakeGatewayDecision("clear");
+        return typeof decisionResponse === "function"
+          ? await decisionResponse(decisionRequests[decisionRequests.length - 1].body)
+          : decisionResponse;
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
       const body = await req.text();
@@ -556,7 +564,7 @@ function serveFakeGateway(
     requests,
     classifierRequests,
     confirmationRequests,
-    evaluationRequests,
+    decisionRequests,
     titleRequests,
     modelRequests,
     requestCount() {

@@ -4,15 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
+  fakeGatewayDecision,
   fakeGatewayFinalText,
   fakeShellRun,
   startFakeGateway,
+  type FakeGatewayOptions,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
 const MODEL = "openai/gpt-5";
-const EXECUTED_MARKER = "JEV_OVERRIDE_EXECUTED";
-const JEV_MODEL_ID = "typesafeai/jev";
+const EXECUTED_MARKER = "REVIEW_OVERRIDE_EXECUTED";
+const DECISION_MODEL = "typesafe-ai/jev";
+const GATEWAY_KEY = "fake-review-model-override-key";
 
 type IsolatedRoot = {
   root: string;
@@ -22,10 +25,8 @@ type IsolatedRoot = {
 
 const roots: string[] = [];
 const gateways: Array<{ stop(): void }> = [];
-const jevServers: Array<{ stop(): void }> = [];
 
 afterEach(() => {
-  for (const server of jevServers.splice(0)) server.stop();
   for (const gateway of gateways.splice(0)) gateway.stop();
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
@@ -48,363 +49,130 @@ function createIsolatedRoot(settings: Record<string, unknown> = {}): IsolatedRoo
   return { root, home, workspace: realpathSync(workspace) };
 }
 
-function jevResponse(decision: "clear" | "caution") {
-  return {
-    model: "jev-1.13.0",
-    answers: {
-      decision: {
-        type: "choice",
-        choice: decision,
-        probabilities:
-          decision === "clear"
-            ? { clear: 0.99, caution: 0.01 }
-            : { clear: 0.02, caution: 0.98 },
-        confidence: 0.97,
+// Runs one auto-mode turn whose model asks to print the marker, then ends
+// with `finalText`. The review of that command is the test's subject.
+async function runReviewedCommand(options: {
+  settings?: Record<string, unknown>;
+  env?: Record<string, string | undefined>;
+  gateway?: FakeGatewayOptions;
+  finalText?: string;
+}) {
+  const root = createIsolatedRoot(options.settings);
+  const gateway = startFakeGateway(
+    [
+      fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
+      fakeGatewayFinalText(options.finalText ?? "Ran the command."),
+    ],
+    options.gateway,
+  );
+  gateways.push(gateway);
+  const result = await runFx(
+    ["ask", "--auto", "--quiet", "--json", "Print the marker."],
+    {
+      cwd: root.workspace,
+      env: {
+        HOME: root.home,
+        AI_GATEWAY_API_KEY: GATEWAY_KEY,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: MODEL,
+        FX_PERMISSION_MODE: "auto",
+        FX_AUTO_UPGRADE: "0",
+        FX_REVIEW_MODEL: undefined,
+        NO_COLOR: "1",
+        ...options.env,
       },
+      timeoutMs: TIMEOUT,
     },
-    usage: { input_tokens: 100, output_tokens: 10 },
-  };
-}
-
-function startJevStub(decision: "clear" | "caution" = "clear") {
-  const requests: Array<{ body: string; headers: Headers }> = [];
-  const server = Bun.serve({
-    port: 0,
-    hostname: "127.0.0.1",
-    async fetch(req) {
-      if (req.method !== "POST") return new Response("not found", { status: 404 });
-      requests.push({ body: await req.text(), headers: new Headers(req.headers) });
-      return Response.json(jevResponse(decision));
-    },
-  });
-  const stub = {
-    requests,
-    url: `http://127.0.0.1:${server.port}/v1/systemone`,
-    stop() {
-      server.stop(true);
-    },
-  };
-  jevServers.push(stub);
-  return stub;
-}
-
-// A System One endpoint that answers 200 and drops the connection partway
-// through the body.
-function startCutJevStub() {
-  let requests = 0;
-  const body = JSON.stringify(jevResponse("clear"));
-  const server = Bun.listen({
-    hostname: "127.0.0.1",
-    port: 0,
-    socket: {
-      data(socket) {
-        requests++;
-        socket.write(`HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${body.length}\r\n\r\n${body.slice(0, 20)}`);
-        setTimeout(() => socket.terminate(), 50);
-      },
-    },
-  });
-  const stub = {
-    requests: () => requests,
-    url: `http://127.0.0.1:${server.port}/v1/systemone`,
-    stop() {
-      server.stop(true);
-    },
-  };
-  jevServers.push(stub);
-  return stub;
-}
-
-function overrideEnv(
-  root: IsolatedRoot,
-  gateway: ReturnType<typeof startFakeGateway>,
-  extra: Record<string, string | undefined> = {},
-) {
-  return {
-    HOME: root.home,
-    AI_GATEWAY_API_KEY: "fake-review-model-override-key",
-    VERCEL_OIDC_TOKEN: undefined,
-    FX_GATEWAY_BASE_URL: gateway.baseUrl,
-    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: MODEL,
-    FX_PERMISSION_MODE: "auto",
-    FX_AUTO_UPGRADE: "0",
-    NO_COLOR: "1",
-    ...extra,
-  };
+  );
+  return { result, gateway };
 }
 
 describe("review model override", () => {
-  test(
-    "FX_REVIEW_MODEL=typesafeai/jev routes the review to the System One endpoint and executes a cleared action",
-    async () => {
-      const root = createIsolatedRoot();
-      const jev = startJevStub("clear");
-      const gateway = startFakeGateway([
-        fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
-        fakeGatewayFinalText("Ran the command."),
-      ]);
-      gateways.push(gateway);
-      const result = await runFx(
-        ["ask", "--auto", "--quiet", "--json", "Print the marker."],
-        {
-          cwd: root.workspace,
-          env: overrideEnv(root, gateway, {
-            FX_REVIEW_MODEL: JEV_MODEL_ID,
-            TYPESAFE_API_KEY: "e2e-typesafe-key",
-            TYPESAFE_BASE_URL: jev.url,
-          }),
-          timeoutMs: TIMEOUT,
-        },
-      );
+  test.each([
+    ["FX_REVIEW_MODEL", {}, { FX_REVIEW_MODEL: DECISION_MODEL }],
+    ["review_model in settings.json", { review_model: DECISION_MODEL }, {}],
+  ])(
+    "%s naming a decision model sends the review to the gateway decision endpoint and runs a cleared action",
+    async (_name, settings, env) => {
+      const { result, gateway } = await runReviewedCommand({ settings, env });
       expect(result.code).toBe(0);
       expect(result.stdout).toContain(EXECUTED_MARKER);
-      expect(jev.requests).toHaveLength(1);
       expect(gateway.classifierRequests).toHaveLength(0);
-      const review = JSON.parse(jev.requests[0].body);
-      expect(review.model).toBe("jev-latest");
-      expect(typeof review.state.review_policy).toBe("string");
-      expect(review.state.review_policy.length).toBeGreaterThan(100);
-      expect(review.state.pending_action_tool).toBe("shell");
-      expect(review.state.pending_action_arguments).toContain(EXECUTED_MARKER);
+      expect(gateway.decisionRequests).toHaveLength(1);
+
+      const { body, headers } = gateway.decisionRequests[0];
+      expect(headers.get("authorization")).toBe(`Bearer ${GATEWAY_KEY}`);
+      expect(headers.get("ai-model-id")).toBe(DECISION_MODEL);
+      expect(headers.get("ai-decision-model-specification-version")).toBe("4");
+      const review = JSON.parse(body);
+      expect(review.stateParts).toHaveLength(1);
+      expect(review.stateParts[0].type).toBe("json");
+      const state = review.stateParts[0].value;
+      expect(state.review_policy.length).toBeGreaterThan(100);
+      expect(state.pending_action_tool).toBe("shell");
+      expect(state.pending_action_arguments).toContain(EXECUTED_MARKER);
       expect(review.questions.decision.type).toBe("choice");
       expect(Object.keys(review.questions.decision.criteria)).toEqual([
         "clear",
         "caution",
       ]);
-      expect(jev.requests[0].headers.get("authorization")).toBe(
-        "Bearer e2e-typesafe-key",
-      );
     },
     TIMEOUT,
   );
 
   test(
-    "a Jev caution holds the action and the loop continues",
+    "a decision model's caution holds the action and the loop continues",
     async () => {
-      const root = createIsolatedRoot();
-      const jev = startJevStub("caution");
-      const gateway = startFakeGateway([
-        fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
-        fakeGatewayFinalText("Understood, leaving it unexecuted."),
-      ]);
-      gateways.push(gateway);
-      const result = await runFx(
-        ["ask", "--auto", "--quiet", "--json", "Print the marker."],
-        {
-          cwd: root.workspace,
-          env: overrideEnv(root, gateway, {
-            FX_REVIEW_MODEL: JEV_MODEL_ID,
-            TYPESAFE_API_KEY: "e2e-typesafe-key",
-            TYPESAFE_BASE_URL: jev.url,
-          }),
-          timeoutMs: TIMEOUT,
-        },
-      );
+      const { result, gateway } = await runReviewedCommand({
+        env: { FX_REVIEW_MODEL: DECISION_MODEL },
+        gateway: { decisionResponse: () => fakeGatewayDecision("caution") },
+        finalText: "Understood, leaving it unexecuted.",
+      });
       expect(result.code).toBe(0);
       expect(result.stdout).not.toContain(EXECUTED_MARKER);
       expect(result.stdout).toContain("Understood, leaving it unexecuted.");
-      expect(jev.requests).toHaveLength(1);
+      expect(gateway.decisionRequests).toHaveLength(1);
     },
     TIMEOUT,
   );
 
-  test(
-    "a Jev answer cut off mid-body holds the action without crashing fx",
-    async () => {
-      const root = createIsolatedRoot();
-      const jev = startCutJevStub();
-      const gateway = startFakeGateway([
-        fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
-        fakeGatewayFinalText("Understood, leaving it unexecuted."),
-      ]);
-      gateways.push(gateway);
-      const result = await runFx(
-        ["ask", "--auto", "--quiet", "--json", "Print the marker."],
-        {
-          cwd: root.workspace,
-          env: overrideEnv(root, gateway, {
-            FX_REVIEW_MODEL: JEV_MODEL_ID,
-            TYPESAFE_API_KEY: "e2e-typesafe-key",
-            TYPESAFE_BASE_URL: jev.url,
-          }),
-          timeoutMs: TIMEOUT,
-        },
-      );
-      expect(result.stderr).not.toContain("panic");
+  test.each([
+    ["fails", () => new Response("upstream unavailable", { status: 500 })],
+    ["answers off the question", () => Response.json({ answers: { decision: { type: "choice", choice: "maybe" } } })],
+    ["declines to answer", () => Response.json({ answers: { decision: { type: "refusal" } } })],
+    ["answers with a truncated body", () => new Response('{"answers":{"decisio', { headers: { "content-type": "application/json" } })],
+  ])(
+    "a decision endpoint that %s holds the action instead of running it unreviewed",
+    async (_name, decisionResponse) => {
+      const { result, gateway } = await runReviewedCommand({
+        env: { FX_REVIEW_MODEL: DECISION_MODEL },
+        gateway: { decisionResponse },
+        finalText: "Review unavailable, holding.",
+      });
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(result.stdout).not.toContain(EXECUTED_MARKER);
-      expect(jev.requests()).toBeGreaterThan(0);
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "review_model in settings.json selects the Jev reviewer without the env var",
-    async () => {
-      const root = createIsolatedRoot({ review_model: JEV_MODEL_ID });
-      const jev = startJevStub("clear");
-      const gateway = startFakeGateway([
-        fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
-        fakeGatewayFinalText("Ran the command."),
-      ]);
-      gateways.push(gateway);
-      const result = await runFx(
-        ["ask", "--auto", "--quiet", "--json", "Print the marker."],
-        {
-          cwd: root.workspace,
-          env: overrideEnv(root, gateway, {
-            FX_REVIEW_MODEL: undefined,
-            TYPESAFE_API_KEY: "e2e-typesafe-key",
-            TYPESAFE_BASE_URL: jev.url,
-          }),
-          timeoutMs: TIMEOUT,
-        },
-      );
-      expect(result.code).toBe(0);
-      expect(result.stdout).toContain(EXECUTED_MARKER);
-      expect(jev.requests).toHaveLength(1);
+      expect(gateway.decisionRequests.length).toBeGreaterThan(0);
       expect(gateway.classifierRequests).toHaveLength(0);
     },
     TIMEOUT,
   );
 
-  test(
-    "review_model set to another gateway chat model keeps the gateway path with that model id",
-    async () => {
-      const root = createIsolatedRoot({ review_model: "openai/gpt-5-alt" });
-      const jev = startJevStub("clear");
-      const gateway = startFakeGateway([
-        fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
-        fakeGatewayFinalText("Ran the command."),
-      ]);
-      gateways.push(gateway);
-      const result = await runFx(
-        ["ask", "--auto", "--quiet", "--json", "Print the marker."],
-        {
-          cwd: root.workspace,
-          env: overrideEnv(root, gateway, {
-            FX_REVIEW_MODEL: undefined,
-            TYPESAFE_API_KEY: "e2e-typesafe-key",
-            TYPESAFE_BASE_URL: jev.url,
-          }),
-          timeoutMs: TIMEOUT,
-        },
-      );
+  test.each([
+    ["review_model naming a language model reviews on the chat endpoint with that model", { review_model: "openai/gpt-5-alt" }, "openai/gpt-5-alt"],
+    ["no review model reviews with the default language model", {}, "openai/gpt-5.6-luna"],
+  ])(
+    "%s",
+    async (_name, settings, reviewer) => {
+      const { result, gateway } = await runReviewedCommand({ settings });
       expect(result.code).toBe(0);
       expect(result.stdout).toContain(EXECUTED_MARKER);
+      expect(gateway.decisionRequests).toHaveLength(0);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(
         gateway.classifierRequests[0].headers.get("ai-language-model-id"),
-      ).toBe("openai/gpt-5-alt");
-      expect(jev.requests).toHaveLength(0);
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "without FX_REVIEW_MODEL the default gateway reviewer is used even when TypeSafe credentials exist",
-    async () => {
-      const root = createIsolatedRoot();
-      const jev = startJevStub("clear");
-      const gateway = startFakeGateway([
-        fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
-        fakeGatewayFinalText("Ran the command."),
-      ]);
-      gateways.push(gateway);
-      const result = await runFx(
-        ["ask", "--auto", "--quiet", "--json", "Print the marker."],
-        {
-          cwd: root.workspace,
-          env: overrideEnv(root, gateway, {
-            FX_REVIEW_MODEL: undefined,
-            TYPESAFE_API_KEY: "e2e-typesafe-key",
-            TYPESAFE_BASE_URL: jev.url,
-          }),
-          timeoutMs: TIMEOUT,
-        },
-      );
-      expect(result.code).toBe(0);
-      expect(result.stdout).toContain(EXECUTED_MARKER);
-      expect(gateway.classifierRequests).toHaveLength(1);
-      expect(
-        gateway.classifierRequests[0].headers.get("ai-language-model-id"),
-      ).toBe("openai/gpt-5.6-luna");
-      expect(jev.requests).toHaveLength(0);
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "without TYPESAFE_API_KEY the Jev review goes through the gateway evaluation endpoint",
-    async () => {
-      const root = createIsolatedRoot();
-      const gateway = startFakeGateway([
-        fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
-        fakeGatewayFinalText("Ran the command."),
-      ]);
-      gateways.push(gateway);
-      const result = await runFx(
-        ["ask", "--auto", "--quiet", "--json", "Print the marker."],
-        {
-          cwd: root.workspace,
-          env: overrideEnv(root, gateway, {
-            FX_REVIEW_MODEL: JEV_MODEL_ID,
-            TYPESAFE_API_KEY: undefined,
-            TYPESAFE_BASE_URL: undefined,
-          }),
-          timeoutMs: TIMEOUT,
-        },
-      );
-      expect(result.code).toBe(0);
-      expect(result.stdout).toContain(EXECUTED_MARKER);
-      expect(gateway.evaluationRequests).toHaveLength(1);
-      expect(gateway.classifierRequests).toHaveLength(0);
-      const review = JSON.parse(gateway.evaluationRequests[0].body);
-      expect(review.model).toBe("typesafe-ai/jev");
-      expect(review.questions.decision.type).toBe("choice");
-      expect(
-        gateway.evaluationRequests[0].headers.get("authorization"),
-      ).toBe("Bearer fake-review-model-override-key");
-      expect(
-        gateway.evaluationRequests[0].headers.get("ai-language-model-id"),
-      ).toBe("typesafe-ai/jev");
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "a failing Jev evaluation endpoint holds the action instead of executing unreviewed",
-    async () => {
-      const root = createIsolatedRoot();
-      const gateway = startFakeGateway(
-        [
-          fakeShellRun("cmd_1", `printf '%s' "${EXECUTED_MARKER}"`),
-          fakeGatewayFinalText("Review unavailable, holding."),
-        ],
-        {
-          evaluationResponse: new Response("upstream unavailable", {
-            status: 500,
-          }),
-        },
-      );
-      gateways.push(gateway);
-      const result = await runFx(
-        ["ask", "--auto", "--quiet", "--json", "Print the marker."],
-        {
-          cwd: root.workspace,
-          env: overrideEnv(root, gateway, {
-            FX_REVIEW_MODEL: JEV_MODEL_ID,
-            TYPESAFE_API_KEY: undefined,
-            TYPESAFE_BASE_URL: undefined,
-          }),
-          timeoutMs: TIMEOUT,
-        },
-      );
-      expect(result.code).toBe(0);
-      expect(result.stdout).not.toContain(EXECUTED_MARKER);
-      expect(gateway.evaluationRequests.length).toBeGreaterThan(0);
-      expect(gateway.classifierRequests).toHaveLength(0);
+      ).toBe(reviewer);
     },
     TIMEOUT,
   );

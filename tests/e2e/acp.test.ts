@@ -11712,7 +11712,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         expect(existsSync(marker)).toBe(true);
         expect(messages.some((message: any) => message.method === "session/request_permission")).toBe(false);
         expect(gateway.classifierRequests).toHaveLength(0);
-        expect(gateway.evaluationRequests).toHaveLength(0);
+        expect(gateway.decisionRequests).toHaveLength(0);
       } finally {
         await client?.close();
         gateway.stop();

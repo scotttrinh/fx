@@ -281,11 +281,11 @@ export class Fixture {
     const marker = join(this.workspace, `probe-${this.probeCount}.txt`);
     this.probe = { id: `probe_call_${this.probeCount}`, marker };
     const asked0 = acp.permissionRequests;
-    const reviewed0 = this.gateway.classifierRequests.length + this.gateway.evaluationRequests.length;
+    const reviewed0 = this.gateway.classifierRequests.length + this.gateway.decisionRequests.length;
     const response = await acp.call("session/prompt", { sessionId, prompt: [{ type: "text", text: "write the probe marker" }] });
     this.probe = null;
     const asked = acp.permissionRequests - asked0;
-    const reviewed = this.gateway.classifierRequests.length + this.gateway.evaluationRequests.length - reviewed0;
+    const reviewed = this.gateway.classifierRequests.length + this.gateway.decisionRequests.length - reviewed0;
     const ran = existsSync(marker);
     const ok = !response.error && response.result?.stopReason === "end_turn";
     const how = asked > 0 && reviewed > 0 ? "asked+reviewed" : asked > 0 ? "asked" : reviewed > 0 ? "reviewed" : "direct";

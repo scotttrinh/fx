@@ -410,8 +410,6 @@
     "TMPDIR",
     "TMUX",
     "TMUX_PANE",
-    "TYPESAFE_API_KEY",
-    "TYPESAFE_BASE_URL",
     "USER",
     "USERPROFILE",
     "WAYLAND_DISPLAY",
