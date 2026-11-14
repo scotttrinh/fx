@@ -377,24 +377,32 @@ pub const Provider = struct {
 };
 
 pub const Reviewer = struct {
-    transport: ?Transport = null,
-    /// Reviews with one decision-model question in place of `transport`'s
-    /// language-model tool call.
-    decision_model: ?decision_mod.Model = null,
-    override_context: ?*anyopaque = null,
-    override_fn: ?OverrideFn = null,
+    backend: Backend = .none,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     timeout_ms: u32 = default_timeout_ms,
     model: []const u8 = "",
 
     pub const default_timeout_ms: u32 = 30_000;
 
+    /// What answers a review. Whatever it points at is borrowed until
+    /// `review` returns.
+    pub const Backend = union(enum) {
+        /// Nothing does, so every review is unavailable.
+        none,
+        /// The host or a test returns the whole outcome.
+        override: struct { context: *anyopaque, review_fn: OverrideFn },
+        /// A language model answers with one `permission_decision` tool call.
+        transport: Transport,
+        /// A decision model answers one choice question.
+        decision_model: decision_mod.Model,
+    };
+
     pub fn disabled() Reviewer {
         return .{};
     }
 
     pub fn withOverride(context: *anyopaque, override_fn: OverrideFn) Reviewer {
-        return .{ .override_context = context, .override_fn = override_fn };
+        return .{ .backend = .{ .override = .{ .context = context, .review_fn = override_fn } } };
     }
 
     fn withTransport(
@@ -403,7 +411,7 @@ pub const Reviewer = struct {
         timeout_ms: u32,
     ) Reviewer {
         return .{
-            .transport = transport,
+            .backend = .{ .transport = transport },
             .cancel_flag = cancel_flag,
             .timeout_ms = timeout_ms,
             .model = "test/reviewer",
@@ -417,21 +425,20 @@ pub const Reviewer = struct {
         model: []const u8,
     ) Reviewer {
         return .{
-            .transport = transport,
+            .backend = .{ .transport = transport },
             .cancel_flag = cancel_flag,
             .timeout_ms = timeout_ms,
             .model = model,
         };
     }
 
-    /// `model` is borrowed until `review` returns.
     pub fn withDecisionModel(
         model: decision_mod.Model,
         cancel_flag: ?*std.atomic.Value(bool),
         timeout_ms: u32,
     ) Reviewer {
         return .{
-            .decision_model = model,
+            .backend = .{ .decision_model = model },
             .cancel_flag = cancel_flag,
             .timeout_ms = timeout_ms,
             .model = model.model_id,
@@ -443,17 +450,15 @@ pub const Reviewer = struct {
         alloc: std.mem.Allocator,
         request: ReviewRequest,
     ) !ParseOutcome {
-        if (self.override_fn) |override_fn| {
-            return override_fn(
-                self.override_context orelse return .{ .invalid = .override_context_missing },
-                alloc,
-                request,
-            ) catch |err| switch (err) {
+        switch (self.backend) {
+            .none => return .{ .invalid = .transport_unconfigured },
+            .override => |override| return override.review_fn(override.context, alloc, request) catch |err| switch (err) {
                 error.OutOfMemory, error.Cancelled => return err,
                 else => return .{ .invalid = .override_failed },
-            };
+            },
+            // Both models answer the same composed review.
+            .transport, .decision_model => {},
         }
-        if (self.transport == null and self.decision_model == null) return .{ .invalid = .transport_unconfigured };
         var fallback_cancel = std.atomic.Value(bool).init(false);
         const cancel_flag = self.cancel_flag orelse &fallback_cancel;
         const deadline = reviewAttemptDeadline(self.timeout_ms);
@@ -542,11 +547,48 @@ pub const Reviewer = struct {
         const instructions = [_]types.ChatMessage{.{ .role = .system, .content = instruction }};
         const messages = [_]types.ChatMessage{ user_message, target_pending_assistant };
 
-        if (self.decision_model) |model| {
-            return self.reviewWithDecisionModel(alloc, model, request, &instructions, &messages, deadline, cancel_flag, started_ms);
-        }
-        const transport = self.transport.?;
-        checkBudget(deadline, cancel_flag) catch |err| return constructionFailure(err);
+        const composed: Composed = .{
+            .request = request,
+            .instructions = &instructions,
+            .messages = &messages,
+            .trusted_root_context = trusted_root_context,
+            .deadline = deadline,
+            .cancel_flag = cancel_flag,
+            .started_ms = started_ms,
+        };
+        return switch (self.backend) {
+            .transport => |transport| self.reviewWithTransport(alloc, transport, composed),
+            .decision_model => |model| self.reviewWithDecisionModel(alloc, model, composed),
+            .none, .override => unreachable, // Returned above.
+        };
+    }
+
+    /// One review as composed for either model. Every field is borrowed from
+    /// `review` for the length of the call.
+    const Composed = struct {
+        request: ReviewRequest,
+        /// The policy with its evidence, as one system message.
+        instructions: []const types.ChatMessage,
+        /// The host-selected context, then the exact pending call.
+        messages: []const types.ChatMessage,
+        trusted_root_context: []const u8,
+        deadline: std.Io.Clock.Timestamp,
+        cancel_flag: *std.atomic.Value(bool),
+        started_ms: i64,
+    };
+
+    /// Asks a language model for one `permission_decision` tool call. A
+    /// caution must quote its evidence, and holds only when a second review
+    /// agrees.
+    fn reviewWithTransport(
+        self: Reviewer,
+        alloc: std.mem.Allocator,
+        transport: Transport,
+        composed: Composed,
+    ) !ParseOutcome {
+        const review_turn = composed.request.review_turn;
+        const cancel_flag = composed.cancel_flag;
+        checkBudget(composed.deadline, cancel_flag) catch |err| return constructionFailure(err);
         const tools_json = toolsJsonAlloc(alloc) catch |err| return constructionFailure(err);
         defer alloc.free(tools_json);
         const payload = transport.build_fn(
@@ -554,30 +596,30 @@ pub const Reviewer = struct {
             alloc,
             self.model,
             tools_json,
-            &instructions,
-            &messages,
+            composed.instructions,
+            composed.messages,
             review_turn.target_call_id,
-            deadline,
+            composed.deadline,
             cancel_flag,
         ) catch |err| return constructionFailure(err);
         defer alloc.free(payload);
         debug_trace.logf(
             "permission",
             "event=auto_review_compose_result result=ready payload_bytes={d} elapsed_ms={d} target_call_id={s}",
-            .{ payload.len, io_mod.milliTimestamp() - started_ms, review_turn.target_call_id },
+            .{ payload.len, io_mod.milliTimestamp() - composed.started_ms, review_turn.target_call_id },
         );
 
         const prompt: ReviewPrompt = .{
             .transport = transport,
             .payload = payload,
-            .instructions = &instructions,
-            .messages = &messages,
+            .instructions = composed.instructions,
+            .messages = composed.messages,
             .tools_json = tools_json,
             .cancel_flag = cancel_flag,
-            .request = request,
-            .trusted_root_context = trusted_root_context,
+            .request = composed.request,
+            .trusted_root_context = composed.trusted_root_context,
         };
-        const decision = try self.decide(alloc, prompt, deadline, .checked);
+        const decision = try self.decide(alloc, prompt, composed.deadline, .checked);
         if (decision != .valid or decision.valid.decision != .caution) return decision;
         return self.confirmCaution(alloc, decision, prompt);
     }
@@ -590,14 +632,12 @@ pub const Reviewer = struct {
         self: Reviewer,
         alloc: std.mem.Allocator,
         model: decision_mod.Model,
-        request: ReviewRequest,
-        instructions: []const types.ChatMessage,
-        messages: []const types.ChatMessage,
-        deadline: std.Io.Clock.Timestamp,
-        cancel_flag: *std.atomic.Value(bool),
-        started_ms: i64,
+        composed: Composed,
     ) !ParseOutcome {
-        const review_turn = request.review_turn;
+        const review_turn = composed.request.review_turn;
+        const instructions = composed.instructions;
+        const messages = composed.messages;
+        const cancel_flag = composed.cancel_flag;
         const state_json = auto_classifier_decision.stateJsonAlloc(
             alloc,
             instructions[0].content.?,
@@ -612,13 +652,13 @@ pub const Reviewer = struct {
         debug_trace.logf(
             "permission",
             "event=auto_review_compose_result result=ready payload_bytes={d} elapsed_ms={d} target_call_id={s}",
-            .{ state_json.len, io_mod.milliTimestamp() - started_ms, review_turn.target_call_id },
+            .{ state_json.len, io_mod.milliTimestamp() - composed.started_ms, review_turn.target_call_id },
         );
 
         var transport_retry_available = true;
         var format_retry_available = true;
         var attempt: u8 = 1;
-        var send_deadline = deadline;
+        var send_deadline = composed.deadline;
         while (true) : (attempt += 1) {
             checkBudget(send_deadline, cancel_flag) catch |err| return constructionFailure(err);
             debug_trace.logf(

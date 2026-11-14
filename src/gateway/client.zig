@@ -29,6 +29,47 @@ pub fn isRetryableGatewayError(err: anyerror) bool {
         err == error.LocalAddressGone;
 }
 
+/// How one bounded request failed, for a side call such as a permission
+/// review that retries a transient failure or a timeout once and never
+/// retries the rest.
+pub const RequestFailure = enum {
+    transient_failure,
+    permanent_failure,
+    timed_out,
+    cancelled,
+
+    /// Classifies an error other than `error.OutOfMemory`, which the caller
+    /// returns as it is.
+    pub fn fromError(err: anyerror, cancel_flag: *const std.atomic.Value(bool)) RequestFailure {
+        if (err == error.Cancelled or cancel_flag.load(.seq_cst)) return .cancelled;
+        if (err == error.Timeout) return .timed_out;
+        return if (isRetryableGatewayError(err)) .transient_failure else .permanent_failure;
+    }
+
+    /// Classifies a status other than 200.
+    pub fn fromStatus(status: std.http.Status) RequestFailure {
+        const code: u16 = @backingInt(status);
+        return if (code == 408 or code == 425 or code == 429 or code >= 500) .transient_failure else .permanent_failure;
+    }
+};
+
+test "a failed side-call request is transient only when asking again can help" {
+    var cancel = std.atomic.Value(bool).init(false);
+    try std.testing.expectEqual(RequestFailure.timed_out, RequestFailure.fromError(error.Timeout, &cancel));
+    try std.testing.expectEqual(RequestFailure.transient_failure, RequestFailure.fromError(error.ConnectionResetByPeer, &cancel));
+    try std.testing.expectEqual(RequestFailure.permanent_failure, RequestFailure.fromError(error.AccessDenied, &cancel));
+    try std.testing.expectEqual(RequestFailure.cancelled, RequestFailure.fromError(error.Cancelled, &cancel));
+    cancel.store(true, .seq_cst);
+    try std.testing.expectEqual(RequestFailure.cancelled, RequestFailure.fromError(error.Timeout, &cancel));
+
+    for ([_]u16{ 408, 425, 429, 500, 503 }) |code| {
+        try std.testing.expectEqual(RequestFailure.transient_failure, RequestFailure.fromStatus(@fromBackingInt(@intCast(code))));
+    }
+    for ([_]u16{ 400, 401, 403, 404 }) |code| {
+        try std.testing.expectEqual(RequestFailure.permanent_failure, RequestFailure.fromStatus(@fromBackingInt(@intCast(code))));
+    }
+}
+
 pub fn networkFailureEvidence(
     err: anyerror,
     delivery: DeliveryCertainty.State,

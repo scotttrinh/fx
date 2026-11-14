@@ -20,6 +20,7 @@ const decision_suffix = "/decision-model";
 /// A decision response is a few answers and their metadata. A larger body is
 /// not one.
 const max_response_bytes: usize = 256 * 1024;
+const max_url_bytes: usize = 4096;
 
 /// The models AI Gateway serves through its decision endpoint. The gateway's
 /// public catalog marks them with the `decision` type (`evaluation` before the
@@ -57,23 +58,45 @@ pub fn isDecisionModelId(model_id: []const u8) bool {
     return false;
 }
 
-/// Writes the decision endpoint beside the gateway chat URL into `out` and
-/// returns it. Null when `chat_url` is not a gateway chat URL or `out` is too
-/// small.
-pub fn urlForChatUrl(chat_url: []const u8, out: []u8) ?[]const u8 {
-    if (!std.mem.endsWith(u8, chat_url, chat_suffix)) return null;
-    const base = chat_url[0 .. chat_url.len - chat_suffix.len];
-    return std.mem.print(out, "{s}{s}", .{ base, decision_suffix }) catch null;
-}
-
-/// One gateway decision model. Every slice is borrowed for as long as the
-/// `decision.Model` from `model` is in use.
+/// One gateway decision model. It holds its own endpoint URL; its other
+/// slices are borrowed for as long as the `decision.Model` from `model` is in
+/// use.
 pub const Config = struct {
     api_key: []const u8,
-    team: ?[]const u8 = null,
-    /// The gateway's decision endpoint, from `urlForChatUrl`.
-    url: []const u8,
+    team: ?[]const u8,
     model_id: []const u8,
+    url_buffer: [max_url_bytes]u8,
+    url_len: usize,
+
+    pub const Options = struct {
+        api_key: []const u8,
+        team: ?[]const u8 = null,
+        /// The gateway chat URL the session's requests go to.
+        chat_url: []const u8,
+        model_id: []const u8,
+    };
+
+    /// The model at the decision endpoint beside `options.chat_url`. Null
+    /// when that is not a gateway chat URL.
+    pub fn init(options: Options) ?Config {
+        if (!std.mem.endsWith(u8, options.chat_url, chat_suffix)) return null;
+        const base = options.chat_url[0 .. options.chat_url.len - chat_suffix.len];
+        var config: Config = .{
+            .api_key = options.api_key,
+            .team = options.team,
+            .model_id = options.model_id,
+            .url_buffer = undefined,
+            .url_len = 0,
+        };
+        const written = std.mem.print(&config.url_buffer, "{s}{s}", .{ base, decision_suffix }) catch return null;
+        config.url_len = written.len;
+        return config;
+    }
+
+    /// The gateway's decision endpoint.
+    pub fn url(self: *const Config) []const u8 {
+        return self.url_buffer[0..self.url_len];
+    }
 
     pub fn model(self: *Config) decision.Model {
         return .{
@@ -94,7 +117,7 @@ fn decide(
 ) Allocator.Error!decision.ModelOutcome {
     const config: *const Config = @ptrCast(@alignCast(raw));
     if (call.cancel_flag.load(.seq_cst)) return .cancelled;
-    if (config.api_key.len == 0 or config.url.len == 0) {
+    if (config.api_key.len == 0) {
         debug_trace.logf("decision", "event=gateway_decision result=permanent_failure reason=missing_gateway_config", .{});
         return .permanent_failure;
     }
@@ -106,28 +129,17 @@ fn decide(
     var operation = PostOperation{ .alloc = alloc, .config = config, .payload = payload };
     var answer = gateway_client.runBoundedHttpOperation(HttpAnswer, alloc, call.cancel_flag, call.deadline, &operation) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        const outcome: decision.ModelOutcome = if (err == error.Cancelled or call.cancel_flag.load(.seq_cst))
-            .cancelled
-        else if (err == error.Timeout)
-            .timed_out
-        else if (gateway_client.isRetryableGatewayError(err))
-            .transient_failure
-        else
-            .permanent_failure;
-        debug_trace.logf("decision", "event=gateway_decision result={s} error={s}", .{ @tagName(outcome), @errorName(err) });
-        return outcome;
+        const failure = gateway_client.RequestFailure.fromError(err, call.cancel_flag);
+        debug_trace.logf("decision", "event=gateway_decision result={s} error={s}", .{ @tagName(failure), @errorName(err) });
+        return failed(failure);
     };
     defer answer.deinit(alloc);
     if (call.cancel_flag.load(.seq_cst)) return .cancelled;
 
     if (answer.status != .ok) {
-        const code: u16 = @backingInt(answer.status);
-        const outcome: decision.ModelOutcome = if (code == 408 or code == 425 or code == 429 or code >= 500)
-            .transient_failure
-        else
-            .permanent_failure;
-        debug_trace.logf("decision", "event=gateway_decision result={s} http_status={d}", .{ @tagName(outcome), code });
-        return outcome;
+        const failure = gateway_client.RequestFailure.fromStatus(answer.status);
+        debug_trace.logf("decision", "event=gateway_decision result={s} http_status={d}", .{ @tagName(failure), @backingInt(answer.status) });
+        return failed(failure);
     }
 
     const response = parseResponse(alloc, answer.body) catch |err| switch (err) {
@@ -143,6 +155,15 @@ fn decide(
         response.usage.output_tokens orelse 0,
     });
     return .{ .response = response };
+}
+
+fn failed(failure: gateway_client.RequestFailure) decision.ModelOutcome {
+    return switch (failure) {
+        .transient_failure => .transient_failure,
+        .permanent_failure => .permanent_failure,
+        .timed_out => .timed_out,
+        .cancelled => .cancelled,
+    };
 }
 
 const HttpAnswer = struct {
@@ -188,7 +209,7 @@ const PostOperation = struct {
         defer self.alloc.free(buffer);
         var response_writer = std.Io.Writer.fixed(buffer);
         const result = gateway_client.fetchOnOpenJob(.{
-            .location = .{ .url = self.config.url },
+            .location = .{ .url = self.config.url() },
             .method = .POST,
             .payload = self.payload,
             .headers = .{
@@ -428,14 +449,13 @@ test "isDecisionModelId tells gateway decision models from language models" {
 }
 
 test "the decision endpoint sits beside the gateway chat endpoint" {
-    var buf: [128]u8 = undefined;
-    try testing.expectEqualStrings(
-        "https://ai-gateway.vercel.sh/v4/ai/decision-model",
-        urlForChatUrl("https://ai-gateway.vercel.sh/v4/ai/language-model", &buf).?,
-    );
-    try testing.expect(urlForChatUrl("https://example.test/chat", &buf) == null);
-    var small: [8]u8 = undefined;
-    try testing.expect(urlForChatUrl("https://ai-gateway.vercel.sh/v4/ai/language-model", &small) == null);
+    const config = Config.init(.{ .api_key = "gw-key", .chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model", .model_id = "typesafe-ai/jev" }).?;
+    try testing.expectEqualStrings("https://ai-gateway.vercel.sh/v4/ai/decision-model", config.url());
+
+    try testing.expect(Config.init(.{ .api_key = "gw-key", .chat_url = "https://example.test/chat", .model_id = "typesafe-ai/jev" }) == null);
+    const long_host: [max_url_bytes]u8 = @splat('a');
+    const too_long = "https://" ++ long_host ++ ".test/v4/ai/language-model";
+    try testing.expect(Config.init(.{ .api_key = "gw-key", .chat_url = too_long, .model_id = "typesafe-ai/jev" }) == null);
 }
 
 test "the request body carries ordered state parts and every question type" {
@@ -461,7 +481,7 @@ test "a gateway decision posts to the endpoint and decides every question" {
     );
     defer server.deinit();
     try server.start();
-    var config = Config{ .api_key = "gw-key", .team = "test-team", .url = server.url, .model_id = "openai/gpt-6-luna-decisions" };
+    var config = Config.init(.{ .api_key = "gw-key", .team = "test-team", .chat_url = server.chat_url, .model_id = "openai/gpt-6-luna-decisions" }).?;
     var cancel = std.atomic.Value(bool).init(false);
 
     var outcome = try decision.decide(testing.allocator, config.model(), .{
@@ -513,7 +533,7 @@ test "a failed gateway decision reports how it failed" {
         var server = try FakeGateway.init(case.status, case.body);
         defer server.deinit();
         try server.start();
-        var config = Config{ .api_key = "gw-key", .url = server.url, .model_id = "typesafe-ai/jev" };
+        var config = Config.init(.{ .api_key = "gw-key", .chat_url = server.chat_url, .model_id = "typesafe-ai/jev" }).?;
         var cancel = std.atomic.Value(bool).init(false);
         var outcome = try decision.decide(testing.allocator, config.model(), .{ .state = &.{}, .questions = &refund_question }, testCall(&cancel));
         defer outcome.deinit();
@@ -523,16 +543,16 @@ test "a failed gateway decision reports how it failed" {
 
 test "a gateway decision without a credential or after cancellation sends nothing" {
     // Nothing listens here, so a request that went out would fail another way.
-    const url = "http://127.0.0.1:1/v4/ai/decision-model";
+    const chat_url = "http://127.0.0.1:1/v4/ai/language-model";
     const request: decision.Request = .{ .state = &.{}, .questions = &refund_question };
 
-    var unconfigured = Config{ .api_key = "", .url = url, .model_id = "typesafe-ai/jev" };
+    var unconfigured = Config.init(.{ .api_key = "", .chat_url = chat_url, .model_id = "typesafe-ai/jev" }).?;
     var cancel = std.atomic.Value(bool).init(false);
     var missing = try decision.decide(testing.allocator, unconfigured.model(), request, testCall(&cancel));
     defer missing.deinit();
     try testing.expectEqual(std.meta.Tag(decision.Outcome).permanent_failure, std.meta.activeTag(missing));
 
-    var config = Config{ .api_key = "gw-key", .url = url, .model_id = "typesafe-ai/jev" };
+    var config = Config.init(.{ .api_key = "gw-key", .chat_url = chat_url, .model_id = "typesafe-ai/jev" }).?;
     cancel.store(true, .seq_cst);
     var cancelled = try decision.decide(testing.allocator, config.model(), request, testCall(&cancel));
     defer cancelled.deinit();
@@ -543,7 +563,8 @@ test "a gateway decision without a credential or after cancellation sends nothin
 const FakeGateway = struct {
     io_backend: std.Io.Threaded = .init_single_threaded,
     server: std.Io.net.Server,
-    url: []u8,
+    /// The gateway chat URL whose decision endpoint this server answers.
+    chat_url: []u8,
     status: []const u8,
     body: []const u8,
     serving: testing_listener.ServerThread = .{},
@@ -552,11 +573,11 @@ const FakeGateway = struct {
     request_len: usize = 0,
 
     fn init(status: []const u8, body: []const u8) !FakeGateway {
-        var self = FakeGateway{ .server = undefined, .url = undefined, .status = status, .body = body };
+        var self = FakeGateway{ .server = undefined, .chat_url = undefined, .status = status, .body = body };
         const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
         self.server = try address.listen(self.io_backend.io(), .{ .reuse_address = true });
         errdefer self.server.deinit(self.io_backend.io());
-        self.url = try testing.allocator.print("http://127.0.0.1:{d}/v4/ai/decision-model", .{self.server.socket.address.getPort()});
+        self.chat_url = try testing.allocator.print("http://127.0.0.1:{d}/v4/ai/language-model", .{self.server.socket.address.getPort()});
         return self;
     }
 
@@ -578,7 +599,7 @@ const FakeGateway = struct {
             if (self.failure == null) self.failure = err;
         };
         self.server.deinit(self.io_backend.io());
-        testing.allocator.free(self.url);
+        testing.allocator.free(self.chat_url);
         if (self.failure) |err| std.debug.panic("fake gateway failed: {s}", .{@errorName(err)});
     }
 
